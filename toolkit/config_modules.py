@@ -565,6 +565,8 @@ class TrainConfig:
         self.linear_timesteps = kwargs.get('linear_timesteps', False)
         self.linear_timesteps2 = kwargs.get('linear_timesteps2', False)
         self.disable_sampling = kwargs.get('disable_sampling', False)
+        # Used only when timestep_type is explicitly set to infonoise.
+        self.infonoise = kwargs.get('infonoise', {})
 
         # will cache a blank prompt or the trigger word, and unload the text encoder to cpu
         # will make training faster and use less vram
@@ -1544,6 +1546,10 @@ def validate_configs(
     save_config: SaveConfig,
     dataset_configs: List[DatasetConfig]
 ):
+    if train_config.timestep_type == 'infonoise':
+        from toolkit.samplers.infonoise import validate_infonoise
+        validate_infonoise(train_config, model_config, dataset_configs)
+
     if model_config.is_flux:
         if save_config.save_format != 'diffusers':
             # make it diffusers

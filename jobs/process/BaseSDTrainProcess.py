@@ -110,6 +110,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             self.network_config = None
         self.train_config = TrainConfig(**self.get_conf('train', {}))
+        self.infonoise_sampler = None
         model_config = self.get_conf('model', {})
         self.modules_being_trained: List[torch.nn.Module] = []
 
@@ -259,6 +260,28 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.ema: ExponentialMovingAverage = None
         
         validate_configs(self.train_config, self.model_config, self.save_config, self.dataset_configs)
+        if self.train_config.timestep_type == 'infonoise':
+            from toolkit.samplers.infonoise import InfoNoiseSampler, validate_process
+            validate_process(self)
+            # Changed trainable components can leave unmatched checkpoint weights freshly initialized.
+            network_context = {'type': self.network_config.type.lower() if self.network_config is not None else 'full'}
+            if network_context['type'] == 'lokr':
+                network_context.update({key: getattr(self.network_config, key) for key in (
+                    'lokr_full_rank', 'lokr_factor', 'linear', 'linear_alpha', 'conv', 'conv_alpha')})
+            for key in ('embedding', 'adapter', 'decorator'):
+                options = self.get_conf(key, None)
+                if options is not None:
+                    network_context[key] = copy.deepcopy(options)
+            self.infonoise_sampler = InfoNoiseSampler(
+                self.train_config.infonoise,
+                context={'arch': self.model_config.arch, 'prediction': 'flow_velocity',
+                         'network': network_context,
+                         'name_or_path': self.model_config.name_or_path,
+                         'extras_name_or_path': self.model_config.extras_name_or_path},
+                warmup_shift=getattr(self.train_config, 'timestep_shift', 0.0),
+                warmup_scale=getattr(self.train_config, 'timestep_scale', 1.0),
+            )
+            print_acc('Using InfoNoise timestep sampling')
         
         do_profiler = self.get_conf('torch_profiler', False)
         self.torch_profiler = None if not do_profiler else torch.profiler.profile(
@@ -533,7 +556,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 for key, value in additional_save_meta.items():
                     save_meta[key] = value
 
+        # Keep adaptive state atomically paired with this checkpoint's weights.
+        if self.infonoise_sampler is not None:
+            save_meta['infonoise'] = self.infonoise_sampler.state_dict()
+
         # prepare meta
+        raw_save_meta = save_meta
         save_meta = get_meta_for_safetensors(save_meta, self.job.name)
         if not self.is_fine_tuning and not self.train_config.merge_network_on_save:
             if self.network is not None:
@@ -569,7 +597,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.embed_config.save_format == "pt":
                     # replace extension
                     emb_file_path = os.path.splitext(emb_file_path)[0] + ".pt"
-                self.embedding.save(emb_file_path)
+                if self.infonoise_sampler is not None:
+                    self.embedding.save(emb_file_path, metadata=save_meta)
+                else:
+                    self.embedding.save(emb_file_path)
             
             if self.decorator is not None:
                 dec_filename = f'{self.job.name}{step_num}.safetensors'
@@ -624,7 +655,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     )
                     meta_path = os.path.join(name_or_path, 'aitk_meta.yaml')
                     with open(meta_path, 'w') as f:
-                        yaml.dump(self.meta, f)
+                        if self.infonoise_sampler is not None:
+                            yaml.safe_dump(json.loads(json.dumps(raw_save_meta)), f)
+                        else:
+                            yaml.dump(self.meta, f)
                     # move it back
                     self.adapter = self.adapter.to(orig_device, dtype=orig_dtype)
                 else:
@@ -882,8 +916,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if os.path.exists(meta_path):
                 with open(meta_path, 'r') as f:
                     meta = yaml.load(f, Loader=yaml.FullLoader)
+        elif self.infonoise_sampler is not None and path.endswith(('.pt', '.bin')):
+            checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+            meta = parse_metadata_from_safetensors(checkpoint.get('aitk_meta', {}))
         else:
             meta = load_metadata_from_safetensors(path)
+        if self.infonoise_sampler is not None:
+            if meta is not None and 'infonoise' in meta:
+                self.infonoise_sampler.load_state_dict(meta['infonoise'])
+                print_acc(f'Restored InfoNoise sampler at update {self.infonoise_sampler.optimizer_steps}')
+            elif not self.infonoise_sampler.config.allow_legacy_resume:
+                raise ValueError('Checkpoint has no InfoNoise state. Set train.infonoise.allow_legacy_resume: true to explicitly start a fresh sampler warmup.')
+            else:
+                print_acc('Legacy checkpoint: InfoNoise starts fresh warmup at optimizer step 0')
+
         # if 'training_info' in Orderdict keys
         if meta is not None and 'training_info' in meta and 'step' in meta['training_info'] and self.train_config.start_step is None:
             self.step_num = meta['training_info']['step']
@@ -950,6 +996,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return params
 
     def get_sigmas(self, timesteps, n_dim=4, dtype=torch.float32):
+        if getattr(self.sd.noise_scheduler, 'timestep_type', None) == 'infonoise':
+            sigma = (timesteps / 1000).to(device=self.device, dtype=dtype)
+            return sigma.reshape(-1, *([1] * (n_dim - 1)))
         sigmas = self.sd.noise_scheduler.sigmas.to(device=self.device, dtype=dtype)
         schedule_timesteps = self.sd.noise_scheduler.timesteps.to(self.device)
         timesteps = timesteps.to(self.device)
@@ -1038,6 +1087,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return noise
 
     def process_general_training_batch(self, batch: 'DataLoaderBatchDTO'):
+        if self.infonoise_sampler is not None and (
+                batch.unconditional_tensor is not None or batch.unconditional_latents is not None):
+            raise ValueError('InfoNoise does not support paired guidance losses')
         with torch.no_grad():
             with self.timer('prepare_prompt'):
                 prompts = batch.get_caption_list()
@@ -1165,7 +1217,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 num_train_timesteps = self.train_config.num_train_timesteps
 
-                if self.train_config.noise_scheduler in ['custom_lcm']:
+                if self.infonoise_sampler is not None:
+                    eligible = [not item.is_reg for item in batch.file_items]
+                    mass = self.infonoise_sampler.sampling_mass(batch_size, eligible)
+                    self.infonoise_sampler.set_train_timesteps(
+                        self.sd.noise_scheduler, batch_size, self.device_torch, eligible=eligible)
+                    # Keep the law used for this draw, before observations or refresh change it.
+                    self._infonoise_batch_mass = (mass, batch_size)
+                elif self.train_config.noise_scheduler in ['custom_lcm']:
                     # we store this value on our custom one
                     self.sd.noise_scheduler.set_timesteps(
                         self.sd.noise_scheduler.train_timesteps, device=self.device_torch
@@ -1242,6 +1301,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         device=self.device_torch
                     )
                     timestep_indices = timestep_indices.long()
+                elif self.infonoise_sampler is not None:
+                    # Already sampled the final batch distribution; use every draw once.
+                    timestep_indices = torch.arange(batch_size, device=self.device_torch)
                 elif self.train_config.timestep_type in ['two_step', 'four_step', 'eight_step']:
                     if self.train_config.timestep_type == 'two_step':
                         indice_choices = [0, 499]
@@ -1788,6 +1850,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             noise_scheduler=sampler,
         )
         
+        if self.infonoise_sampler is not None:
+            from toolkit.samplers.infonoise import validate_model
+            validate_model(self.sd)
         self.hook_after_sd_init_before_load()
         # run base sd process run
         self.sd.load_model()
@@ -2067,6 +2132,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # load last saved weights
                 if latest_save_path is not None:
                     self.embedding.load_embedding_from_file(latest_save_path, self.device_torch)
+                    if self.infonoise_sampler is not None:
+                        self.load_training_state_from_metadata(latest_save_path)
                     if self.embedding.step > 1:
                         self.step_num = self.embedding.step
                         self.start_step = self.step_num
@@ -2168,6 +2235,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.ensure_params_requires_grad(force=True)
         optimizer = get_optimizer(self.params, optimizer_type, learning_rate=self.train_config.lr,
                                   optimizer_params=self.train_config.optimizer_params)
+        if self.infonoise_sampler is not None:
+            from toolkit.samplers.infonoise import validate_optimizer
+            validate_optimizer(optimizer)
         self.optimizer = optimizer
         
         # set it to do paramiter swapping
@@ -2651,6 +2721,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 else:
                     raise  # not an OOM; surface real errors
             if did_oom:
+                if self.infonoise_sampler is not None:
+                    self.infonoise_sampler.discard_pending()
                 self.num_consecutive_oom += 1
                 if self.num_consecutive_oom > 3:
                     raise RuntimeError("OOM during training step 3 times in a row, aborting training")

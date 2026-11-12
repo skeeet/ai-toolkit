@@ -553,6 +553,11 @@ class SDTrainer(BaseSDTrainProcess):
             prior_pred: Union[torch.Tensor, None] = None,
             **kwargs
     ):
+        if self.infonoise_sampler is not None:
+            if prior_pred is not None:
+                raise ValueError('InfoNoise does not support teacher-target batches')
+            if noise_pred.shape != noise.shape or noise_pred.shape != batch.latents.shape or noise_pred.ndim not in (4, 5):
+                raise ValueError('InfoNoise needs matching batched image or video flow velocity tensors')
         loss_target = self.train_config.loss_target
         is_reg = any(batch.get_is_reg_list())
         additional_loss = 0.0
@@ -1021,6 +1026,17 @@ class SDTrainer(BaseSDTrainProcess):
             print("Could not apply mask multiplier to loss")
             print(e)
             pass
+
+        if self.infonoise_sampler is not None:
+            if not getattr(self, '_infonoise_target_checked', False):
+                from toolkit.samplers.infonoise import validate_target
+                self._infonoise_target_checked = validate_target(target, noise, batch.latents)
+            # Reuse spatially weighted MSE; without masks the multiplier is one.
+            # Record before per-image loss multipliers or batch averaging.
+            with torch.no_grad():
+                self.infonoise_sampler.record(
+                    timesteps / 1000, loss.detach().flatten(1).mean(1),
+                    [not is_reg for is_reg in batch.get_is_reg_list()])
 
         prior_loss = None
         if self.train_config.inverted_mask_prior and prior_pred is not None and prior_mask_multiplier is not None:
@@ -2347,6 +2363,7 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             batch_list = [batch]
         total_loss = None
+        mass_total, mass_count = [0., 0., 0.], 0
         self.optimizer.zero_grad()
         # micro-batches per optimizer step: a batch list (gradient_accumulation) or repeated
         # calls (gradient_accumulation_steps). -1 (whole epoch) has no fixed count; left summed.
@@ -2367,7 +2384,12 @@ class SDTrainer(BaseSDTrainProcess):
                         if self.current_boundary_index in self.sd.trainable_multistage_boundaries:
                             # if this boundary is trainable, we can stop looking
                             break
+            self._infonoise_batch_mass = None
             loss = self.train_single_accumulation(batch, accum_scale=accum_scale)
+            if self.infonoise_sampler is not None and self._infonoise_batch_mass is not None:
+                mass, count = self._infonoise_batch_mass
+                mass_total = [total + value * count for total, value in zip(mass_total, mass)]
+                mass_count += count
             self.steps_this_boundary += 1
             if total_loss is None:
                 total_loss = loss
@@ -2376,6 +2398,15 @@ class SDTrainer(BaseSDTrainProcess):
             if len(batch_list) > 1 and self.model_config.low_vram:
                 torch.cuda.empty_cache()
 
+
+        if self.infonoise_sampler is not None and mass_count:
+            # Each graph point describes all images drawn in this update, including step 0.
+            mass = [value / mass_count for value in mass_total]
+            log_every = self.logging_config.log_every
+            if self.accelerator.is_main_process and (
+                    log_every is None or (log_every and self.step_num % log_every == 0)):
+                self.logger.log({f'infonoise/mass_{name}': value for name, value in zip(
+                    ('low', 'middle', 'high'), mass)})
 
         if not self.is_grad_accumulation_step:
             # grads of memory-managed (offloaded) params are async D2H copies into
@@ -2391,6 +2422,13 @@ class SDTrainer(BaseSDTrainProcess):
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
                 self.optimizer.step()
+                if self.infonoise_sampler is not None:
+                    refreshed = self.infonoise_sampler.on_optimizer_step(
+                        skipped=self.accelerator.optimizer_step_was_skipped)
+                    if refreshed and mass_count:
+                        mass = [value / mass_count for value in mass_total]
+                        print_acc('InfoNoise mass: ' + ', '.join(
+                            f'{name}={value:.3f}' for name, value in zip(('low', 'middle', 'high'), mass)))
 
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.adapter and isinstance(self.adapter, CustomAdapter):

@@ -221,6 +221,74 @@ from the last checkpoint.
 
 IMPORTANT. If you press crtl+c while it is saving, it will likely corrupt that checkpoint. So wait until it is done saving
 
+### Optional InfoNoise timestep sampling
+
+Enable InfoNoise in the existing `train` section of a flow-matching configuration.
+Keep your model and training method settings:
+
+```yaml
+      train:
+        noise_scheduler: flowmatch
+        timestep_type: infonoise
+        infonoise:
+          bins: 32
+          warmup_type: log_uniform
+          warmup_steps: 500
+          refresh_every: 100
+          gate_pivot: 0 # Automatic onset from the current information profile.
+```
+
+InfoNoise adapts timestep frequency from recent per-image MSE. It reuses the
+existing loss after mask weighting; without masks this is full-image error.
+Warmup and refresh count optimizer updates. Training loss and other timestep
+sampling modes keep their existing behavior.
+
+The default 32 bins have equal width in `log(u/(1-u))`, where `u=0` is clean
+and `u=1` is pure noise. The `log_uniform` warmup prior gives each bin equal probability;
+`uniform` is uniform in `u` and favors the middle bins. Equal bin coverage helps
+estimate the profile with small batches; it is not a guarantee of better images.
+
+Exploration revisits bins whose last valid training observation is old. The
+interval is `max(1, max_stale_steps // (min_count + 1))`: 400 updates by
+default. With 32 bins this costs about 8% of samples at batch 1 or 2% at batch 4
+when all bins need exploration; adaptive visits reduce that cost. Microbatches
+share pending observations, and regularization images do not consume coverage
+slots. Skipped updates and invalid errors do not refresh a bin. Capacity limits
+or repeated failures can delay coverage. Exploration also applies during warmup.
+Set `exploration: false` to disable it.
+
+The graph logs `infonoise/mass_low`, `mass_middle`, and `mass_high` from step 0,
+including warmup, at the configured logging interval. They show the probability
+below `u=0.25`, between `0.25` and `0.75`, and above `0.75` for the distribution
+used by that update, including exploration and all accumulated microbatches,
+weighted by their image counts. They sum to one. At batch 1 an exploration update
+can show a spike in one range. Each refresh prints the same update's mass with
+three decimal places; graph values keep their full precision.
+
+The sampler follows the [paper's](https://arxiv.org/html/2602.18647v2)
+clean-data-error and objective-weight conversion for velocity training.
+Each masked velocity-error observation is multiplied by `u²` before bin averaging.
+In log-relative-noise, the adaptive density is `pi_z ∝ gate * u² * m_x / sigma²`.
+This changes sampling only; masked loss and gradients keep their existing behavior.
+The cubic gate uses the paper's onset threshold on the information density per
+unit relative noise, with an automatic pivot by default. Mask-weighted estimation and
+coverage-based exploration extend the paper's method; masked errors are not its
+unweighted Bayes MMSE.
+
+This implementation uses continuous flow times and velocity MSE. It currently
+requires single-process training; fixed-timestep schedules and altered targets
+need different handling. Use
+`gradient_accumulation` for microbatches. Optimizers must update in `.step()`;
+AutoMagic3 needs `optimizer_params.fused: false`.
+
+Sampler statistics and RNG are saved with checkpoints. A checkpoint without
+sampler state needs `infonoise.allow_legacy_resume: true` to start fresh warmup.
+Changing the bin count requires a new run; existing statistics cannot be resumed
+with a different grid. State version 4 uses clean-data errors and sigma-density onset. Earlier
+sampler states are incompatible; load adapter weights into a new
+run without resuming the old sampler. `allow_legacy_resume` only permits missing
+state, not an incompatible version.
+
 ### Need help?
 
 Please do not open a bug report unless it is a bug in the code. You are welcome to [Join my Discord](https://discord.gg/VXmU2f5WEU)

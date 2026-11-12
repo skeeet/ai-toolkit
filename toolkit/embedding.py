@@ -186,7 +186,7 @@ class Embedding:
 
         return state_dict
 
-    def save(self, filename):
+    def save(self, filename, metadata=None):
         # todo check to see how to get the vector out of the embedding
 
         embedding_data = {
@@ -200,17 +200,19 @@ class Embedding:
             "notes": None,
         }
         # TODO we do not currently support this. Check how auto is doing it. Only safetensors supported sor sdxl
-        if filename.endswith('.pt'):
-            torch.save(embedding_data, filename)
-        elif filename.endswith('.bin'):
+        if filename.endswith(('.pt', '.bin')):
+            if metadata is not None:
+                embedding_data['aitk_meta'] = metadata
             torch.save(embedding_data, filename)
         elif filename.endswith('.safetensors'):
             # save the embedding as a safetensors file
             state_dict = self.state_dict()
             # add all embedding data (except string_to_param), to metadata
-            metadata = OrderedDict({k: json.dumps(v) for k, v in embedding_data.items() if k != "string_to_param"})
-            metadata["string_to_param"] = {"*": "emb_params"}
-            save_meta = get_meta_for_safetensors(metadata, name=self.name)
+            embedding_meta = OrderedDict({k: json.dumps(v) for k, v in embedding_data.items() if k != "string_to_param"})
+            embedding_meta["string_to_param"] = {"*": "emb_params"}
+            save_meta = get_meta_for_safetensors(embedding_meta, name=self.name)
+            if metadata is not None:
+                save_meta.update({key: value for key, value in metadata.items() if key not in save_meta})
             save_file(state_dict, filename, metadata=save_meta)
 
     def load_embedding_from_file(self, file_path, device):
