@@ -776,18 +776,31 @@ export default function SimpleJob({
                       label="Timestep Type"
                       value={jobConfig.config.process[0].train.timestep_type}
                       disabled={disableSections.includes('train.timestep_type') || false}
-                      onChange={value => setJobConfig(value, 'config.process[0].train.timestep_type')}
+                      onChange={value => {
+                        if (value === 'infonoise') {
+                          setJobConfig({
+                            ...jobConfig.config.process[0].train,
+                            timestep_type: value,
+                            content_or_style: 'balanced',
+                            content_or_style_reg: 'balanced',
+                          }, 'config.process[0].train');
+                        } else {
+                          setJobConfig(value, 'config.process[0].train.timestep_type');
+                        }
+                      }}
                       options={[
                         { value: 'sigmoid', label: 'Sigmoid' },
                         { value: 'linear', label: 'Linear' },
                         { value: 'shift', label: 'Shift' },
                         { value: 'weighted', label: 'Weighted' },
+                        { value: 'infonoise', label: 'InfoNoise' },
                       ]}
                     />
                   )}
                   <SelectInput
                     label="Timestep Bias"
                     className="pt-2"
+                    disabled={jobConfig.config.process[0].train.timestep_type === 'infonoise'}
                     value={jobConfig.config.process[0].train.content_or_style}
                     onChange={value => setJobConfig(value, 'config.process[0].train.content_or_style')}
                     options={[

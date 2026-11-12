@@ -1,6 +1,7 @@
 import os
 import random
 from collections import OrderedDict
+from copy import copy
 from typing import Union, Literal, List, Optional
 
 import numpy as np
@@ -42,6 +43,8 @@ from toolkit.unloader import unload_text_encoder
 from PIL import Image
 from torchvision.transforms import functional as TF
 from toolkit.basic import flush
+from toolkit.util.ostris_quant import OstrisLinear
+from toolkit.samplers.infonoise import validate_target as validate_infonoise_target
 
 
 adapter_transforms = transforms.Compose([
@@ -551,8 +554,14 @@ class SDTrainer(BaseSDTrainProcess):
             batch: 'DataLoaderBatchDTO',
             mask_multiplier: Union[torch.Tensor, float] = 1.0,
             prior_pred: Union[torch.Tensor, None] = None,
+            infonoise_probe: bool = False,
             **kwargs
     ):
+        if self.infonoise_sampler is not None:
+            if prior_pred is not None:
+                raise ValueError('InfoNoise does not support teacher-target batches')
+            if noise_pred.shape != noise.shape or noise_pred.shape != batch.latents.shape or noise_pred.ndim not in (4, 5):
+                raise ValueError('InfoNoise needs matching batched image or video flow velocity tensors')
         loss_target = self.train_config.loss_target
         is_reg = any(batch.get_is_reg_list())
         additional_loss = 0.0
@@ -1022,6 +1031,19 @@ class SDTrainer(BaseSDTrainProcess):
             print(e)
             pass
 
+        if self.infonoise_sampler is not None:
+            if not getattr(self, '_infonoise_target_checked', False):
+                self._infonoise_target_checked = validate_infonoise_target(target, noise, batch.latents)
+            # Reuse spatially weighted MSE; without masks the multiplier is one.
+            # Record before per-image loss multipliers or batch averaging.
+            with torch.no_grad():
+                self.infonoise_sampler.record(
+                    timesteps / 1000, loss.detach().flatten(1).mean(1),
+                    [not is_reg for is_reg in batch.get_is_reg_list()],
+                    probe=infonoise_probe)
+            if infonoise_probe:
+                return loss.detach().mean()
+
         prior_loss = None
         if self.train_config.inverted_mask_prior and prior_pred is not None and prior_mask_multiplier is not None:
             assert not self.train_config.train_turbo
@@ -1458,6 +1480,70 @@ class SDTrainer(BaseSDTrainProcess):
                 # backward stays inside the network context (see the note in the diffusion path)
                 self.accelerator.backward(loss * accum_scale if accum_scale != 1.0 else loss)
         return loss.detach()
+
+    @torch.no_grad()
+    def _probe_infonoise(self, batch, noise, conditional_embeds, unconditional_embeds,
+                        mask_multiplier, pred_kwargs):
+        sampler = self.infonoise_sampler
+        eligible = [not is_reg for is_reg in batch.get_is_reg_list()]
+        times = sampler.probe_times(eligible)
+        if times is None:
+            return
+        times = times.to(noise.device)
+        scheduler = self.sd.noise_scheduler
+        probe_scheduler = copy(scheduler)
+        probe_scheduler.timesteps = times
+        probe_scheduler.sigmas = torch.cat((times / 1000, times.new_zeros(1)))
+        probe_scheduler._step_index = probe_scheduler._begin_index = None
+        # Keep the active network and conditioning, but isolate forward state.
+        # Snapshot registered buffers because no_grad does not freeze them.
+        model = self.sd.get_model_to_train() if hasattr(self.sd, 'get_model_to_train') else None
+        modules = {}
+        for root in (model, self.network, self.adapter):
+            if isinstance(root, torch.nn.Module):
+                for module in root.modules():
+                    # OstrisLinear owns its packed weights as local buffers.
+                    # Its forward reads them in place; child modules are still visited.
+                    if isinstance(module, OstrisLinear):
+                        continue
+                    if module._buffers and module not in modules:
+                        modules[module] = module._buffers.copy()
+        batch = copy(batch)
+        logs = self.additional_logs.copy()
+        python_rng, numpy_rng = random.getstate(), np.random.get_state()
+        cuda_devices = [noise.device.index] if noise.is_cuda else []
+        mps_rng = torch.mps.get_rng_state() if noise.device.type == 'mps' else None
+        try:
+            for module, buffers in modules.items():
+                module._buffers.update({key: value.clone() for key, value in buffers.items()
+                                        if value is not None})
+            self.sd.noise_scheduler = probe_scheduler
+            with torch.random.fork_rng(devices=cuda_devices):
+                # Reuse the batch's independent Gaussian draw at a different u.
+                noisy = self.sd.add_noise(batch.latents, noise, times)
+                noisy = self.sd.condition_noisy_latents(noisy, batch)
+                if isinstance(self.adapter, CustomAdapter):
+                    noisy = self.adapter.condition_noisy_latents(noisy, batch)
+                prediction = self.predict_noise(
+                    noisy_latents=noisy, timesteps=times,
+                    conditional_embeds=conditional_embeds.detach(),
+                    unconditional_embeds=(unconditional_embeds.detach()
+                                          if unconditional_embeds is not None else None),
+                    batch=batch,
+                    **pred_kwargs)
+                self.calculate_loss(prediction, noise, noisy, times, batch,
+                                    mask_multiplier=mask_multiplier, infonoise_probe=True)
+        finally:
+            self.sd.noise_scheduler = scheduler
+            self.additional_logs.clear()
+            self.additional_logs.update(logs)
+            random.setstate(python_rng)
+            np.random.set_state(numpy_rng)
+            if mps_rng is not None:
+                torch.mps.set_rng_state(mps_rng)
+            for module, buffers in modules.items():
+                module._buffers.clear()
+                module._buffers.update(buffers)
 
     def train_single_accumulation(self, batch: DataLoaderBatchDTO, accum_scale: float = 1.0):
         # accum_scale: 1 / number of micro-batches accumulated per optimizer step, so the
@@ -2338,6 +2424,13 @@ class SDTrainer(BaseSDTrainProcess):
                     # else:
                     self.accelerator.backward(loss * accum_scale if accum_scale != 1.0 else loss)
 
+                # Measure after backward while the same adapter and conditioning
+                # are active. The optimizer commits observations with this update.
+                if self.infonoise_sampler is not None:
+                    with self.timer('infonoise_probe'):
+                        self._probe_infonoise(batch, noise, conditional_embeds, unconditional_embeds,
+                                              mask_multiplier, pred_kwargs)
+
         return loss.detach()
         # flush()
 
@@ -2347,6 +2440,7 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             batch_list = [batch]
         total_loss = None
+        mass_total, mass_count = [0., 0., 0.], 0
         self.optimizer.zero_grad()
         # micro-batches per optimizer step: a batch list (gradient_accumulation) or repeated
         # calls (gradient_accumulation_steps). -1 (whole epoch) has no fixed count; left summed.
@@ -2367,7 +2461,12 @@ class SDTrainer(BaseSDTrainProcess):
                         if self.current_boundary_index in self.sd.trainable_multistage_boundaries:
                             # if this boundary is trainable, we can stop looking
                             break
+            self._infonoise_batch_mass = None
             loss = self.train_single_accumulation(batch, accum_scale=accum_scale)
+            if self.infonoise_sampler is not None and self._infonoise_batch_mass is not None:
+                mass, count = self._infonoise_batch_mass
+                mass_total = [total + value * count for total, value in zip(mass_total, mass)]
+                mass_count += count
             self.steps_this_boundary += 1
             if total_loss is None:
                 total_loss = loss
@@ -2376,6 +2475,22 @@ class SDTrainer(BaseSDTrainProcess):
             if len(batch_list) > 1 and self.model_config.low_vram:
                 torch.cuda.empty_cache()
 
+
+        if self.infonoise_sampler is not None and mass_count:
+            # Each graph point describes all images drawn in this update, including step 0.
+            mass = [value / mass_count for value in mass_total]
+            log_every = self.logging_config.log_every
+            if self.accelerator.is_main_process and (
+                    log_every is None or (log_every and self.step_num % log_every == 0)):
+                ranges = ('low', 'middle', 'high')
+                metrics = {f'infonoise/mass_{name}': value for name, value in zip(ranges, mass)}
+                sampler = self.infonoise_sampler
+                if sampler.cdf is not None and sampler.pre_floor_mass is not None:
+                    metrics['infonoise/gate_pivot'] = sampler.pivot
+                    metrics['infonoise/proposed_pivot'] = sampler.proposed_pivot
+                    metrics.update({f'infonoise/pre_floor_{name}': value
+                                    for name, value in zip(ranges, sampler.pre_floor_mass)})
+                self.logger.log(metrics)
 
         if not self.is_grad_accumulation_step:
             # grads of memory-managed (offloaded) params are async D2H copies into
@@ -2391,6 +2506,13 @@ class SDTrainer(BaseSDTrainProcess):
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
                 self.optimizer.step()
+                if self.infonoise_sampler is not None:
+                    refreshed = self.infonoise_sampler.on_optimizer_step(
+                        skipped=self.accelerator.optimizer_step_was_skipped)
+                    if refreshed and mass_count:
+                        mass = [value / mass_count for value in mass_total]
+                        print_acc('InfoNoise mass: ' + ', '.join(
+                            f'{name}={value:.3f}' for name, value in zip(('low', 'middle', 'high'), mass)))
 
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.adapter and isinstance(self.adapter, CustomAdapter):

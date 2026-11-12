@@ -221,6 +221,66 @@ from the last checkpoint.
 
 IMPORTANT. If you press crtl+c while it is saving, it will likely corrupt that checkpoint. So wait until it is done saving
 
+### Optional InfoNoise timestep sampling
+
+See the [algorithm description](INFONOISE.md) for the math and sampling rules.
+
+Select **InfoNoise** under **Timestep Type** in the job editor. This selects **Balanced** for the fixed bias and locks that control while InfoNoise is selected. In YAML, enable it in the existing `train` section of a flow-matching MSE configuration.
+Keep your model and training method settings:
+
+```yaml
+      train:
+        noise_scheduler: flowmatch
+        timestep_type: infonoise
+        infonoise:
+          bins: 16
+          half_life_steps: 250
+          warmup_type: log_uniform
+          warmup_steps: 500
+          refresh_every: 100
+          gate_pivot: 0 # Automatic onset from the current information profile.
+```
+
+InfoNoise adapts timestep frequency from recent per-image MSE. It reuses the
+existing loss after mask weighting; without masks this is full-image error.
+Warmup and refresh count optimizer updates. Training loss and other timestep
+sampling modes keep their existing behavior.
+
+The default 16 bins have equal width in `log(u/(1-u))`, where `u=0` is clean
+and `u=1` is pure noise. The `log_uniform` warmup prior gives each bin equal probability;
+`uniform` is uniform in `u` and favors the middle bins. Equal bin coverage helps
+estimate the profile with small batches; it is not a guarantee of better images.
+
+Each sufficiently populated bin contributes one age-weighted estimate at its observed mean log-noise coordinate. Observations lose half their weight every 250 completed updates by default. The sampler refreshes throughout training.
+
+Exploration collects an extra forward pass on the prepared batch when some
+intervals are short of observations. Probes use the same masked error and count
+only after a successful optimizer update. They do not replace training samples
+or contribute gradients. Remove the old `exploration` key from existing configurations.
+
+The graph logs training probabilities from step 0, including warmup. The low,
+mid, and high series split at `u=0.25` and `u=0.75`. Probe observations never
+enter the graph's training probability calculation.
+
+The sampler follows the [paper's](https://arxiv.org/html/2602.18647v2)
+clean-data-error and objective-weight conversion for velocity training.
+Each masked velocity-error observation is multiplied by `u²` before bin averaging.
+In log-relative-noise, the adaptive density is `pi_z ∝ gate * u² * m_x / sigma²`.
+This changes sampling only; masked loss and gradients keep their existing behavior.
+The cubic gate interpolates the paper's onset threshold in log-relative-noise
+and smooths the pivot across refreshes. A separate local correction preserves up to 5% low-noise mass when needed. The pivot and the relative cell probabilities within each side stay intact. Active logs include the proposed and applied pivots and the pre-floor shares. Probes reuse resident OstrisLinear packed weights, including ConvRot8.
+
+InfoNoise uses continuous flow times and velocity MSE in a single process.
+It rejects fixed-timestep schedules, altered targets, and multistage schedules
+that constrain each training stage to a different noise range. Use
+`gradient_accumulation` for microbatches. Optimizers must update in `.step()`.
+AutoMagic3 needs `optimizer_params.fused: false`.
+
+Sampler statistics and RNG are saved with checkpoints. A checkpoint without
+sampler state needs `infonoise.allow_legacy_resume: true` to start fresh warmup.
+Changing the bin count requires a new run; existing statistics cannot be resumed
+with a different grid. State version 6 resumes only v6 sampler checkpoints. To reuse weights from a v5 or earlier run, initialize a fresh run with those weights. Legacy recipes that specify `beta` receive a warning. The new setting is `half_life_steps`.
+
 ### Need help?
 
 Please do not open a bug report unless it is a bug in the code. You are welcome to [Join my Discord](https://discord.gg/VXmU2f5WEU)

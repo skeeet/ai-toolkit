@@ -80,6 +80,10 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         return weights
 
     def get_sigmas(self, timesteps: torch.Tensor, n_dim, dtype, device) -> torch.Tensor:
+        if self.timestep_type == 'infonoise':
+            # Physical flow coefficient is T/1000, including duplicate timesteps.
+            sigma = (timesteps / 1000).to(device=device, dtype=dtype)
+            return sigma.reshape(-1, *([1] * (n_dim - 1)))
         sigmas = self.sigmas.to(device=device, dtype=dtype)
         schedule_timesteps = self.timesteps.to(device)
         timesteps = timesteps.to(device)
