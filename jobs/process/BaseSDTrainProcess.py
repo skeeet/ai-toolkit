@@ -41,6 +41,7 @@ from toolkit.lycoris_special import LycorisSpecialNetwork
 from toolkit.models.decorator import Decorator
 from toolkit.network_mixins import Network
 from toolkit.optimizer import get_optimizer
+from toolkit.optimizer_param_groups import group_network_params_by_transformer_block
 from toolkit.paths import CONFIG_ROOT
 from toolkit.progress_bar import ToolkitProgressBar
 from toolkit.prompt_utils import concat_prompt_embeds
@@ -2024,6 +2025,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     **config
                 )
 
+                if self.network_config.optimizer_grouping == 'transformer_block':
+                    params_net = group_network_params_by_transformer_block(
+                        params_net,
+                        self.sd.get_model_to_train(),
+                        self.network.unet_loras,
+                        self.sd.get_transformer_block_names(),
+                    )
+
                 params += params_net
 
                 if self.train_config.gradient_checkpointing:
@@ -2175,6 +2184,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # only works for adafactor, but it should have thrown an error prior to this otherwise
             self.optimizer.enable_paramiter_swapping(self.train_config.paramiter_swapping_factor)
 
+        if (self.network is not None and self.network_config is not None
+                and self.network_config.optimizer_grouping == 'transformer_block'):
+            parameter_count = sum(
+                p.numel() for group in optimizer.param_groups
+                for p in group['params'] if p.requires_grad
+            )
+            print_acc(
+                f"Optimizer grouping: transformer_block | {len(optimizer.param_groups)} parameter groups"
+                f" | {parameter_count:,} trainable parameters"
+            )
+            if getattr(optimizer, 'independent_groups', False):
+                print_acc('Prodigy adaptation: independent per parameter group')
+
         # check if it exists
         optimizer_state_filename = f'optimizer.pt'
         optimizer_state_file_path = os.path.join(self.save_root, optimizer_state_filename)
@@ -2197,6 +2219,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 try:
                     print_acc(f"Loading optimizer state from {optimizer_state_file_path}")
                     optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True)
+                    if ('prodigy_grouping' in optimizer_state_dict
+                            and not getattr(optimizer, 'independent_groups', False)):
+                        raise ValueError('Independent Prodigy state requires matching transformer_block grouping')
                     optimizer.load_state_dict(optimizer_state_dict)
                     del optimizer_state_dict
                     flush()

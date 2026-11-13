@@ -192,6 +192,12 @@ class NetworkConfig:
         self.conv_alpha: float = kwargs.get('conv_alpha', self.conv)
         self.dropout: Union[float, None] = kwargs.get('dropout', None)
         self.network_kwargs: dict = kwargs.get('network_kwargs', {})
+        self.optimizer_grouping: str = kwargs.get('optimizer_grouping', 'default')
+        if self.optimizer_grouping not in ('default', 'transformer_block'):
+            raise ValueError(
+                "network.optimizer_grouping must be 'default' or 'transformer_block', "
+                f"got {self.optimizer_grouping!r}"
+            )
 
         self.lorm_config: Union[LoRMConfig, None] = None
         lorm = kwargs.get('lorm', None)

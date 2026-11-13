@@ -29,6 +29,10 @@ def get_optimizer(
             print("WARNING: Dadaptation optimizer type has been changed to DadaptationAdam. Please update your config.")
     elif lower_type.startswith("prodigy8bit"):
         from toolkit.optimizers.prodigy_8bit import Prodigy8bit
+        params = list(params)
+        if any(isinstance(group, dict) and group.get('optimizer_grouping') == 'transformer_block'
+               for group in params):
+            from toolkit.optimizers.prodigy_grouped import GroupedProdigy8bit as Prodigy8bit
         print("Using Prodigy optimizer")
         use_lr = learning_rate
         if use_lr < 0.1:
@@ -41,6 +45,10 @@ def get_optimizer(
         optimizer = Prodigy8bit(params, lr=use_lr, eps=1e-6, **optimizer_params)
     elif lower_type.startswith("prodigy"):
         from prodigyopt import Prodigy
+        params = list(params)
+        if any(isinstance(group, dict) and group.get('optimizer_grouping') == 'transformer_block'
+               for group in params):
+            from toolkit.optimizers.prodigy_grouped import GroupedProdigy as Prodigy
 
         print("Using Prodigy optimizer")
         use_lr = learning_rate

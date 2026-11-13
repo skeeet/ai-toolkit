@@ -354,6 +354,60 @@ You can also exclude layers by their names by using `ignore_if_contains` network
 `ignore_if_contains` takes priority over `only_if_contains`. So if a weight is covered by both,
 if will be ignored.
 
+## Optimizer Parameter Grouping
+
+To give each transformer block its own optimizer parameter group during network
+training, set `optimizer_grouping` under `network`:
+
+```yaml
+      network:
+        type: "lora"
+        linear: 32
+        linear_alpha: 32
+        optimizer_grouping: "transformer_block"
+```
+
+The default, `"default"`, preserves the existing grouping. With AutomagicV3/4,
+`"transformer_block"` lets each block adapt its learning rate independently.
+This also works with other optimizers that accept multiple parameter groups.
+When enabled, startup logs the grouping mode, total optimizer group count, and
+trainable parameter count. The default mode adds no grouping log.
+
+For `prodigy` and `prodigy8bit`, this mode also enables independent adaptation
+state for each optimizer group. Each group starts from the configured `d0` and
+maintains its own distance estimate `d`, statistics, and step count.
+This includes any text-encoder or remainder groups in the optimizer. Default
+grouping continues to use the original Prodigy implementation with one shared
+estimate. Keep Prodigy's usual `train.lr: 1.0`; no additional option is needed.
+
+The progress learning rate is the mean of the groups' `d * lr` values, before
+bias correction, when independent Prodigy is enabled. This is an extension of
+Prodigy's global adaptation rule, not a claim of improved training quality.
+Independent Prodigy8bit does not support FSDP because its backend can skip
+collectives for groups without local gradient contributions.
+
+Blocks are identified using the model's `get_transformer_block_names()` declaration,
+or common indexed paths such as `layers.0`, `blocks.0`, `transformer_blocks.0`,
+`double_blocks.0`, and `single_blocks.0` when no declaration is available. Separate
+stacks remain separate even when they use the same block indices. This supports
+MOSS, Qwen Image 2.1, Krea 2, Z-Image, and other models with these block structures.
+
+Only denoiser network parameters are split. Text-encoder grouping is unchanged,
+and parameters outside the transformer blocks stay together in a remainder group.
+Existing groups are split separately to preserve their learning rates and other
+optimizer options. If no trainable block parameters can be identified, training
+raises an error rather than silently using a single group.
+
+Keep the grouping setting unchanged when resuming optimizer state. When switching
+grouping modes, start with fresh optimizer state; an `optimizer.pt` saved with the
+old group layout cannot be loaded into the new layout. Network weights can still
+be loaded normally.
+
+Independent Prodigy checkpoints record their adaptation mode and backend.
+Shared-mode Prodigy state and independent-mode state are not interchangeable,
+even when their parameter-group counts happen to match. Older per-block runs
+that used shared Prodigy state also need fresh optimizer state for this mode.
+
 ## LoKr Training
 
 To learn more about LoKr, read more about it at [KohakuBlueleaf/LyCORIS](https://github.com/KohakuBlueleaf/LyCORIS/blob/main/docs/Guidelines.md). To train a LoKr model, you can adjust the network type in the config file like so:
