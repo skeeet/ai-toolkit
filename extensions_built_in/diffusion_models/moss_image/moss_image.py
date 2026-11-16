@@ -61,7 +61,7 @@ from .src.pipeline import (
     MossImagePipeline,
     stack_text_embeds,
 )
-from .src.transformer import MossImageTransformer
+from .src.transformer import MossImageTransformer, MossImageSplitQKVTransformer
 
 if TYPE_CHECKING:
     from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
@@ -158,6 +158,7 @@ def _drop_repeats(images):
 
 class MossImageModel(BaseModel):
     arch = "moss_image"
+    split_qkv = False
 
     def __init__(
         self,
@@ -180,6 +181,11 @@ class MossImageModel(BaseModel):
         self.latent_space_version = "moss_image"
 
         kw = self.model_config.model_kwargs
+        self.split_qkv = kw.get("split_qkv", False)
+        if not isinstance(self.split_qkv, bool):
+            raise ValueError("MOSS model_kwargs.split_qkv must be a boolean")
+        if self.split_qkv:
+            self.target_lora_modules = ["MossImageSplitQKVTransformer"]
         self.max_text_length = int(kw.get("max_text_length", MAX_TEXT_TOKENS))
         self.sample_shift = float(kw.get("sample_shift", DEFAULT_SHIFT))
         self.uncond_skip_layers = tuple(
@@ -211,7 +217,8 @@ class MossImageModel(BaseModel):
     # Loading
     # ------------------------------------------------------------------
     def _load_transformer(self) -> MossImageTransformer:
-        self.print_and_status_update("Loading transformer (MossImageTransformer)")
+        transformer_cls = MossImageSplitQKVTransformer if self.split_qkv else MossImageTransformer
+        self.print_and_status_update(f"Loading transformer ({transformer_cls.__name__})")
         base = self.model_config.name_or_path
         qtype = self.model_config.qtype if self.model_config.quantize else None
         if os.path.isdir(base):
@@ -226,7 +233,7 @@ class MossImageModel(BaseModel):
                             state_dict[key] = f.get_tensor(key)
             if not state_dict:
                 raise FileNotFoundError(f"no MOSS-Image transformer weights in {folder}")
-            return MossImageTransformer.load_from_state_dict(state_dict, self.torch_dtype)
+            return transformer_cls.load_from_state_dict(state_dict, self.torch_dtype)
         if base.endswith(".safetensors"):
             path = resolve_hub_file(
                 base, hf_token=HF_TOKEN, status_fn=self.print_and_status_update
@@ -239,7 +246,7 @@ class MossImageModel(BaseModel):
                 status_fn=self.print_and_status_update,
             )
         self.print_and_status_update(f" - transformer weights: {path}")
-        return MossImageTransformer.load_model(
+        return transformer_cls.load_model(
             path, dtype=self.torch_dtype, qtype=qtype, quantize_on_load=False
         )
 
@@ -685,6 +692,18 @@ class MossImageModel(BaseModel):
             k for k in state_dict
             if k.endswith((".proj.q.lora_A.weight", ".proj.q.lora_down.weight"))
         ]
+        fused_lokr = any(".proj.qkv.lokr_" in k for k in out)
+        split_lokr = any(
+            f".proj.{p}.lokr_" in k for k in out for p in ("q", "k", "v")
+        )
+        if (self.split_qkv and fused_lokr) or (not self.split_qkv and split_lokr):
+            raise ValueError(
+                "MOSS LoKr checkpoint QKV layout does not match model_kwargs.split_qkv. "
+                "Use the checkpoint's original setting or start a new adapter; "
+                "independent LoKr factors cannot be converted by concatenating them."
+            )
+        if self.split_qkv:
+            return out
         for q_down in down_keys:
             base, _, down_suffix = q_down.partition(".proj.q.")
             up_suffix = "lora_B.weight" if down_suffix == "lora_A.weight" else "lora_up.weight"

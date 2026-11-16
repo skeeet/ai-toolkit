@@ -2,8 +2,9 @@
 
 Port of ``MOSSImageTransformer`` from the vendor's ``pipeline_moss_image.py``
 in the Comfy-Org/MOSS-Image key layout: the vendor's names with each block's
-q/k/v fused into ``proj.qkv`` (vendor shards and split community repacks are
-fused on load), so Comfy files load as-is and LoRA keys match ComfyUI. One stream: image tokens followed by text tokens
+q/k/v fused into ``proj.qkv`` by default. The optional split-QKV subclass
+keeps separate block projections for independent adapters and splits fused
+checkpoint rows before quantized import. One stream: image tokens followed by text tokens
 through 42 blocks that share one AdaLN modulation; the text first goes through
 a 2-block refiner. The vendor evaluates every item alone at its true text
 length; here a batch runs together with padded text masked out of every
@@ -127,16 +128,20 @@ class _TextProjection(nn.Module):
 
 
 class _Block(nn.Module):
-    def __init__(self, dim, ffn_dim, heads):
+    def __init__(self, dim, ffn_dim, heads, split_qkv: bool = False):
         super().__init__()
         self.heads = heads
         self.norm1, self.norm2 = _RMSNorm(dim), _RMSNorm(dim)
         self.q_norm, self.k_norm = _RMSNorm(dim // heads), _RMSNorm(dim // heads)
-        # q/k/v fused (rows q, k, v) like the ComfyUI files; the vendor keeps
-        # them split (fused on load)
+        # Default: fused Q/K/V rows like ComfyUI. Split mode exposes three
+        # independent adapter targets while retaining the same frozen weights.
+        qkv = (
+            {p: nn.Linear(dim, dim, bias=False) for p in ("q", "k", "v")}
+            if split_qkv else {"qkv": nn.Linear(dim, 3 * dim, bias=False)}
+        )
         self.proj = nn.ModuleDict(
             {
-                "qkv": nn.Linear(dim, 3 * dim, bias=False),
+                **qkv,
                 "o": nn.Linear(dim, dim, bias=False),
                 "ffn_up_gate": nn.Linear(dim, 2 * ffn_dim, bias=False),
                 "ffn_down": nn.Linear(ffn_dim, dim, bias=False),
@@ -177,7 +182,10 @@ class _Block(nn.Module):
                 return h * m[g][:, None]
 
         y = affine(self.norm1(x), 1, 0)
-        q, k, v = self.proj["qkv"](y).chunk(3, -1)
+        if "qkv" in self.proj:
+            q, k, v = self.proj["qkv"](y).chunk(3, -1)
+        else:
+            q, k, v = (self.proj[p](y) for p in ("q", "k", "v"))
         q = self.q_norm(q.unflatten(-1, (self.heads, -1))).flatten(2)
         k = self.k_norm(k.unflatten(-1, (self.heads, -1))).flatten(2)
         attn = _attention(
@@ -190,6 +198,8 @@ class _Block(nn.Module):
 
 
 class MossImageTransformer(nn.Module, OstrisModelMixin):
+    split_qkv = False
+
     @classmethod
     def aitk_config_from_state_dict(cls, state_dict):
         # sniffed from unquantized tensors only (block linears may be int8)
@@ -255,7 +265,7 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
         )
         self.shared_block_modulation = nn.Linear(dim, 6 * dim)
         self.layers = nn.ModuleList(
-            [_Block(dim, ffn_dim, heads) for _ in range(params.num_layers)]
+            [_Block(dim, ffn_dim, heads, split_qkv=self.split_qkv) for _ in range(params.num_layers)]
         )
         self.final_norm_video = _RMSNorm(dim)
         self.final_linear_video = nn.Linear(dim, params.latent_channels, bias=False)
@@ -491,6 +501,53 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
         x = x * (1 + head[:, 1, None]) + head[:, 0, None]
         x = self.final_linear_video(x)
         return x.transpose(1, 2).reshape(batch, -1, height, width)
+
+
+class MossImageSplitQKVTransformer(MossImageTransformer):
+    """Independent Q/K/V modules for adapters, with the same frozen base weights."""
+
+    split_qkv = True
+
+    @classmethod
+    def convert_state_dict_on_load(
+        cls, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        state_dict = {k: v for k, v in state_dict.items() if k != "rope.bands"}
+        from toolkit.util.comfy_quant_import import split_fused_quantized_keys
+
+        for key in [k for k in state_dict if k.endswith(".proj.qkv.weight")]:
+            prefix = key[:-len(".weight")]
+            base = prefix[:-len(".qkv")]
+            parts = [f"{base}.{p}" for p in ("q", "k", "v")]
+            if any(f"{p}.weight" in state_dict for p in parts):
+                raise ValueError(f"Mixed fused and split MOSS QKV base weights for {base}")
+            if f"{prefix}.comfy_quant" in state_dict:
+                # Split quantized rows/scales before import, without dequantizing
+                # or requantizing the frozen checkpoint.
+                split_fused_quantized_keys(state_dict, prefix, parts)
+            else:
+                weight = state_dict.pop(key)
+                if weight.shape[0] % 3:
+                    raise ValueError(f"MOSS QKV weight does not divide into three: {key}")
+                for part, value in zip(parts, weight.chunk(3, dim=0)):
+                    state_dict[f"{part}.weight"] = value.contiguous()
+                scale_key = f"{prefix}.scale_weight"
+                if "scaled_fp8" in state_dict and scale_key in state_dict:
+                    # Legacy scaled FP8 uses one weight scale for all fused rows.
+                    scale = state_dict.pop(scale_key)
+                    state_dict.pop(f"{prefix}.scale_input", None)
+                    for part in parts:
+                        state_dict[f"{part}.scale_weight"] = scale
+        return state_dict
+
+    @classmethod
+    def convert_state_dict_on_save(
+        cls, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        # Full-model exports retain the normal fused ComfyUI checkpoint layout.
+        # Adapter exports use MossImageModel's separate conversion path.
+        state_dict = fuse_split_qkv(dict(state_dict))
+        return super().convert_state_dict_on_save(state_dict)
 
 
 def fuse_split_qkv(state_dict):
