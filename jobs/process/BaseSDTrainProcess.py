@@ -272,6 +272,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.steps_this_boundary = 0
         self.num_consecutive_oom = 0
         self.additional_logs = {}
+        self.per_image_training = None
+        self._per_image_resume_state = None
+        if self.train_config.per_image_adaptive['mode'] != 'off':
+            from toolkit.per_image_training import PerImageTraining
+            self.per_image_training = PerImageTraining(self)
+
         # cached latents, prompt embeds, and fixed noise for validation
         self._validation_cache = None
 
@@ -526,6 +532,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         file_path = os.path.join(self.save_root, filename)
 
         save_meta = copy.deepcopy(self.meta)
+        if getattr(self, 'per_image_training', None) is not None:
+            save_meta['per_image_adaptive'] = self.per_image_training.state_dict()
+            self.per_image_training.write_report()
         # get extra meta
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             additional_save_meta = self.adapter.get_additional_save_metadata()
@@ -884,6 +893,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     meta = yaml.load(f, Loader=yaml.FullLoader)
         else:
             meta = load_metadata_from_safetensors(path)
+        if getattr(self, 'per_image_training', None) is not None:
+            if meta is None or 'per_image_adaptive' not in meta:
+                raise ValueError('Checkpoint has no per-image adaptive state; start a new run to enable adaptation')
+            self._per_image_resume_state = copy.deepcopy(meta['per_image_adaptive'])
+
         # if 'training_info' in Orderdict keys
         if meta is not None and 'training_info' in meta and 'step' in meta['training_info'] and self.train_config.start_step is None:
             self.step_num = meta['training_info']['step']
@@ -1789,6 +1803,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
         
         self.hook_after_sd_init_before_load()
+        if self.per_image_training is not None:
+            self.per_image_training.validate_model(self.sd)
         # run base sd process run
         self.sd.load_model()
         
@@ -2277,6 +2293,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         flush()
         self.last_save_step = self.step_num
         ### HOOK ###
+        if getattr(self, 'per_image_training', None) is not None:
+            from toolkit.data_loader import get_dataloader_datasets
+            self.per_image_training.bind(get_dataloader_datasets(self.data_loader))
+            self.per_image_training.write_report()
         self.hook_before_train_loop()
 
         # ============================================================
@@ -2617,6 +2637,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 batch = next(dataloader_iterator)
                     else:
                         batch = None
+                    if self.per_image_training is not None and batch is not None:
+                        batch._per_image_epoch = self.epoch_num
                     batch_list.append(batch)
                     batch_step += 1
 
@@ -2655,6 +2677,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.num_consecutive_oom > 3:
                     raise RuntimeError("OOM during training step 3 times in a row, aborting training")
                 optimizer.zero_grad(set_to_none=True)
+                if getattr(self, 'per_image_training', None) is not None:
+                    self.per_image_training.discard()
                 flush()
                 torch.cuda.ipc_collect()
                 # skip this step and keep going

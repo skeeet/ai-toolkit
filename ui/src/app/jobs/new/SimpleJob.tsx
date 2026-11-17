@@ -1,5 +1,6 @@
 'use client';
 import { useMemo } from 'react';
+import PerImageAdaptiveControls from './PerImageAdaptiveControls';
 import {
   ModelArch,
   quantizationOptions,
@@ -987,6 +988,7 @@ export default function SimpleJob({
                 )}
               </div>
             </div>
+            <PerImageAdaptiveControls jobConfig={jobConfig} modelGroup={modelArch?.group} setJobConfig={setJobConfig} />
           </Card>
         </div>
         <div>

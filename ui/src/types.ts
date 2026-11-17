@@ -121,6 +121,7 @@ export interface DatasetConfig {
   cache_latents_to_disk?: boolean;
   resolution: number[];
   controls: string[];
+  control_from_same_folder?: boolean;
   control_path?: string | null;
   num_frames: number;
   shrink_video_to_frames: boolean;
@@ -193,6 +194,12 @@ export interface TrainConfig {
   validation_config?: ValidationConfig;
   do_guidance_loss?: boolean;
   guidance_loss_target?: number;
+  per_image_adaptive?: {
+    mode: 'off' | 'observe' | 'adaptive';
+    policy?: 'legacy' | 'coverage';
+    warmup_epochs?: number;
+    [key: string]: unknown;
+  };
 }
 
 export interface QuantizeKwargsConfig {

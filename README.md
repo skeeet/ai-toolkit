@@ -221,6 +221,82 @@ from the last checkpoint.
 
 IMPORTANT. If you press crtl+c while it is saving, it will likely corrupt that checkpoint. So wait until it is done saving
 
+### Optional per-image adaptive loss weighting
+Tracks training images in compatible denoiser adapter jobs and optionally adjusts their contributions to the primary image loss. The feature works independently of the Muon patch. Existing configurations default to `off`.
+
+```yaml
+train:
+  per_image_adaptive:
+    mode: adaptive # off, observe, or adaptive
+    policy: coverage # legacy is the default when omitted
+```
+
+`observe` records diagnostics and suggested multipliers without changing the loss. `adaptive` applies them. The Training form provides the mode and warmup controls; advanced settings are available in YAML.
+
+See the [algorithm reference](docs/per-image-loss-weighting-policies.md) for both policies.
+
+#### Coverage policy
+
+Coverage uses four noise bands. It starts evaluating after 16 observed epochs by default. The comparison window grows in even steps up to 40 epochs (`trend_window`). A smaller explicit window can begin earlier. `warmup_epochs` can delay evaluation. Each window half needs observations from at least two distinct epochs in the band. Repeated visits are averaged within an epoch.
+
+A weight change requires at least two agreeing, decisive bands, each with a reference cohort of at least three images. A neutral band abstains. Any conflicting decisive band blocks the change. Each confirmation still requires a fresh observation in one of the agreeing bands.
+
+Difficulty uses the recent cohort within each band. Progress compares the image's own early and late losses in that band. Learning requires a decrease of at least 12% that exceeds the estimated noise of the two window means. A stable window requires a change within 8% after allowing for that noise. A sample at least 15% above the lower-third reference is hard, and a sample at or below that reference and at least 15% below the median is easy.
+
+| Evidence | Multiplier |
+| --- | --- |
+| Hard and improving in two consecutive decisions | 1.10 |
+| Easy and stable in two consecutive decisions | 0.95 |
+| Hard and stable in three consecutive decisions | 0.75 |
+| Warmup, mixed or insufficient evidence, or waiting for confirmation | 1.0 |
+
+Images keep training at every weight. Coverage divides diagnostic loss by the mean of the applied mask so tightly masked images can be compared with broadly masked ones. An individual zero-mass mask contributes no observation. If every mask in a microbatch has zero mass after resizing, Toolkit mask normalization produces a nonfinite loss and the update is skipped. The optimized loss and InfoNoise input keep their existing mask weighting. The report records the policy, candidate, matched band count and consecutive decisions. Sparse or noisy histories can remain at weight 1.0 for the whole run.
+
+#### Legacy policy
+
+Legacy follows [Fizgig's watcher at 11c43efe](https://github.com/shootthesound/Fizgig/blob/11c43efe2eba2d519eb709cb3327e9257b14d4e6/src/fizgig/training/loss_logger.py). It compares each image's loss with the all-run average of its timestep bin, then uses recent trends and persistent outlier votes:
+
+| Classification | Multiplier |
+| --- | --- |
+| Easy, relatively low residual | 1.1 |
+| Ordinary or hard but improving | 1.0 |
+| Suspect outlier | 0.7 |
+| Confirmed stuck | 0.5, falling to a floor of 0.25 |
+| Previously improving, now plateaued above average | 0.6 |
+
+There are 40 timestep bins, two observed warmup epochs, a five-epoch difficulty window, and an eight-epoch trend window. The easy boost starts after three observed epochs. Stuck confirmation requires two votes, escalation occurs every two confirmed boundaries, and release requires three clear votes. Images absent from an epoch receive no new votes. Repeats share history; different dataset roles and relative paths remain distinct. History is bounded to early baseline epochs and the recent window, with all-run bin totals retained.
+
+These are **loss weights, not proportional per-image optimizer learning rates**. For a batch, the primary objective is `mean(image_weight * image_loss)`, without dividing by the sum of weights. With Muon or Adam, scaling a single-image loss may largely cancel during optimizer normalization. The weights can still change relative gradient directions within a batch or accumulation group. Low loss does not prove visual quality, and high residual does not prove an incorrect caption. Coarse timestep bins, rare viewpoints, different masks, and changing timestep distributions can confound the classifier.
+
+#### Supported training
+
+The integration supports LoRA, LoKr, LoCON, LyCORIS, LoRM, and DoRA in single-process SDTrainer jobs with one standard flow velocity MSE loss and one timestep per still image. Krea 2, Qwen Image 2.1, Z-Image-Turbo, and MOSS Base use this objective for ordinary text-to-image training. Both standard flow velocity signs are supported. Edit and reference-conditioned jobs, MOSS SFT, video and joint audio layouts, altered targets, auxiliary objectives, full fine-tuning, FSDP, and single-item batching are unsupported. Masks, regularization images, and gradient accumulation remain supported. Regularization images contribute their existing training loss and are excluded from watcher statistics.
+
+Use an optimizer that updates during `step()`. Set `optimizer_params.fused: false` with AutoMagic3, AutoMagic4, or AutoMagicEXPERIMENT. AdamConvRot supports adaptation with its default unfused mode. Original AutoMagic works with its standard settings. AutoMagic2 always updates inside backward and is unsupported.
+
+Transformer-block grouping, MOSS fused or split-QKV, sigmoid settings, and InfoNoise remain independent. InfoNoise and the watcher both receive errors before adaptive weights; neither learns the other's weighted losses. When combining with InfoNoise, keep `gradient_accumulation_steps: 1` and use `gradient_accumulation` for microbatches, as required by that sampler. No new timestep schedule, global adaptive learning rate, recaptioning, automatic exclusion, or automatic stopping is added.
+
+#### Diagnostics and resume
+
+`per_image_adaptive.json` in the run output lists image identities, policy-specific evidence and current/suggested multipliers. The run logger exposes `per_image/raw_loss` and `per_image/weighted_loss` separately. Both policies observe error before dataset multipliers and SNR weighting.
+
+Only successful optimizer updates contribute observations. OOMs, nonfinite losses/gradients, and skipped updates discard pending observations. Gradient references are retained between outer accumulation calls so the upstream zeroing does not erase accumulated gradients. The existing accumulation normalization and scheduler cadence are retained; whole-epoch accumulation remains summed, as in the Toolkit.
+
+Controller state is embedded in the same checkpoint metadata as adapter weights. Resume checks the policy, controller configuration, image membership, dataset configuration, model, adapter layout and objective. Pre-policy checkpoints resume with the legacy policy. To switch policies or initialize from weights without controller state, start a new run with `network.pretrained_lora_path`. Reports are not the source of resume state.
+
+Image pixels and caption file contents are not hashed. If their contents change under the same paths, start a new run. Exact controller restoration does not restore Toolkit dataloader order or pending gradients; full training replay is not guaranteed. Observations from unfinished gradient accumulation are not saved as accepted training evidence.
+
+#### Validation
+
+Run the offline CPU tests from the repository root using the existing Python environment:
+
+```bash
+CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  python -B -m unittest -v testing.test_per_image_adaptive testing.test_per_image_training
+```
+
+UI source changes require a build and restart. GPU training speed, memory use and image quality have not been measured.
+
 ### Need help?
 
 Please do not open a bug report unless it is a bug in the code. You are welcome to [Join my Discord](https://discord.gg/VXmU2f5WEU)

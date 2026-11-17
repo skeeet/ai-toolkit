@@ -50,6 +50,7 @@ adapter_transforms = transforms.Compose([
 
 
 class SDTrainer(BaseSDTrainProcess):
+    supports_per_image_adaptation = True
 
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
         super().__init__(process_id, job, config, **kwargs)
@@ -568,6 +569,14 @@ class SDTrainer(BaseSDTrainProcess):
         audio_target = noise_pred.get('audio_target') if isinstance(noise_pred, DTO) else None
         audio_sigma = noise_pred.get('audio_sigma') if isinstance(noise_pred, DTO) else None
 
+        per_image_training = getattr(self, 'per_image_training', None)
+        if per_image_training is not None:
+            if audio_pred is not None or audio_target is not None:
+                raise ValueError('Per-image adaptation does not support joint audio predictions')
+            if prior_pred is not None:
+                raise ValueError('Per-image adaptation requires unmodified flow velocity targets')
+            per_image_training.validate_batch(noise_pred, noise, batch, timesteps)
+
         has_mask = batch.mask_tensor is not None
 
         with torch.no_grad():
@@ -878,6 +887,9 @@ class SDTrainer(BaseSDTrainProcess):
 
         ignore_snr = False
 
+        if per_image_training is not None:
+            per_image_training.validate_target(target, noise, batch)
+
         if loss_target == 'source' or loss_target == 'unaugmented':
             assert not self.train_config.train_turbo
             # ignore_snr = True
@@ -1010,12 +1022,14 @@ class SDTrainer(BaseSDTrainProcess):
             mask_multiplier = torch.nn.functional.interpolate(mask_multiplier, size=(pred.shape[2], pred.shape[3]), mode='nearest')
 
         # multiply by our mask
+        mask_applied = False
         try:
             if len(noise_pred.shape) == 5:
                 # video B,C,T,H,W
                 mask_multiplier = mask_multiplier.unsqueeze(2)  # add time dimension back for video
                 mask_multiplier = mask_multiplier.repeat(1, 1, noise_pred.shape[2], 1, 1)
             loss = loss * mask_multiplier
+            mask_applied = True
         except Exception as e:
             # todo handle mask with video models
             print("Could not apply mask multiplier to loss")
@@ -1047,6 +1061,16 @@ class SDTrainer(BaseSDTrainProcess):
             loss = loss.mean([1, 2, 3, 4])
         else:
             loss = loss.mean([1, 2, 3])
+        if per_image_training is not None:
+            mask_mass = None
+            if mask_applied and per_image_training.watch.config['policy'] == 'coverage':
+                if torch.is_tensor(mask_multiplier):
+                    mask = mask_multiplier.detach()
+                    mask = mask.reshape((1,) * (4 - mask.ndim) + mask.shape)
+                    mask_mass = mask.mean(dim=(1, 2, 3), dtype=torch.float32).expand_as(loss)
+                elif mask_multiplier != 1.0:
+                    mask_mass = loss.new_full(loss.shape, mask_multiplier)
+            loss = per_image_training.apply(loss, batch, timesteps, mask_mass=mask_mass)
         # apply loss multiplier before prior loss
         # multiply by our mask
         try:
@@ -2322,6 +2346,8 @@ class SDTrainer(BaseSDTrainProcess):
                 # check if nan
                 if not torch.isfinite(loss):
                     print_acc("loss is nan")
+                    if getattr(self, 'per_image_training', None) is not None:
+                        self.per_image_training.invalid = True
                     loss = torch.zeros_like(loss).requires_grad_(True)
 
                 with self.timer('backward'):
@@ -2355,6 +2381,8 @@ class SDTrainer(BaseSDTrainProcess):
             n_accum *= self.train_config.gradient_accumulation_steps
         accum_scale = 1.0 / n_accum
         for batch in batch_list:
+            if getattr(self, 'per_image_training', None) is not None:
+                self.per_image_training.restore_gradients()
             if self.sd.is_multistage:
                 # handle multistage switching
                 if self.steps_this_boundary >= self.train_config.switch_boundary_every or self.current_boundary_index not in self.sd.trainable_multistage_boundaries:
@@ -2381,6 +2409,19 @@ class SDTrainer(BaseSDTrainProcess):
             # grads of memory-managed (offloaded) params are async D2H copies into
             # pinned tensors; join them before anything on the CPU reads .grad
             sync_grad_transfers()
+            if getattr(self, 'per_image_training', None) is not None:
+                self.per_image_training.prepare_gradients()
+                finite = not self.per_image_training.invalid and all(
+                    torch.isfinite(p.grad).all().item()
+                    for group in self.optimizer.param_groups for p in group['params'] if p.grad is not None)
+                if not finite:
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.per_image_training.finish(stepped=True, skipped=True)
+                    self._muon_accumulated_grads = []
+                    sampler = getattr(self, 'infonoise_sampler', None)
+                    if sampler is not None:
+                        sampler.discard_pending()
+                    return OrderedDict({'loss': 0.0})
             # fix this for multi params
             if self.train_config.optimizer != 'adafactor':
                 if isinstance(self.params[0], dict):
@@ -2401,6 +2442,11 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             # gradient accumulation. Just a place for breakpoint
             pass
+
+        if getattr(self, 'per_image_training', None) is not None:
+            self.per_image_training.finish(
+                stepped=not self.is_grad_accumulation_step,
+                skipped=getattr(self.accelerator, 'optimizer_step_was_skipped', False))
 
         # TODO Should we only step scheduler on grad step? If so, need to recalculate last step
         with self.timer('scheduler_step'):

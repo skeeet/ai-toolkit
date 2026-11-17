@@ -392,6 +392,8 @@ class TrainConfig:
         self.adapter_lr = kwargs.get('adapter_lr', self.lr)
         self.optimizer = kwargs.get('optimizer', 'adamw')
         self.optimizer_params = kwargs.get('optimizer_params', {})
+        from toolkit.per_image_adaptive import PerImageAdaptive
+        self.per_image_adaptive = PerImageAdaptive(kwargs.get('per_image_adaptive')).config.copy()
         self.lr_scheduler = kwargs.get('lr_scheduler', 'constant')
         self.lr_scheduler_params = kwargs.get('lr_scheduler_params', {})
         self.min_denoising_steps: int = kwargs.get('min_denoising_steps', 0)
