@@ -2322,6 +2322,8 @@ class SDTrainer(BaseSDTrainProcess):
                 # check if nan
                 if not torch.isfinite(loss):
                     print_acc("loss is nan")
+                    if self.train_config.optimizer.lower() == 'muon':
+                        self._muon_invalid_loss = True
                     loss = torch.zeros_like(loss).requires_grad_(True)
 
                 with self.timer('backward'):
@@ -2354,6 +2356,9 @@ class SDTrainer(BaseSDTrainProcess):
         if self.train_config.gradient_accumulation_steps > 1:
             n_accum *= self.train_config.gradient_accumulation_steps
         accum_scale = 1.0 / n_accum
+        if self.train_config.optimizer.lower() == 'muon':
+            from toolkit.optimizers.muon_training import restore_gradients
+            restore_gradients(self)
         for batch in batch_list:
             if self.sd.is_multistage:
                 # handle multistage switching
@@ -2381,6 +2386,10 @@ class SDTrainer(BaseSDTrainProcess):
             # grads of memory-managed (offloaded) params are async D2H copies into
             # pinned tensors; join them before anything on the CPU reads .grad
             sync_grad_transfers()
+            if self.train_config.optimizer.lower() == 'muon':
+                from toolkit.optimizers.muon_training import skip_invalid_update
+                if skip_invalid_update(self):
+                    return OrderedDict({'loss': 0.0})
             # fix this for multi params
             if self.train_config.optimizer != 'adafactor':
                 if isinstance(self.params[0], dict):
@@ -2420,5 +2429,8 @@ class SDTrainer(BaseSDTrainProcess):
         )
 
         self.end_of_training_loop()
+        if self.train_config.optimizer.lower() == 'muon':
+            from toolkit.optimizers.muon_training import retain_gradients
+            retain_gradients(self)
 
         return loss_dict

@@ -174,6 +174,11 @@ export interface TrainConfig {
   cache_text_embeddings: boolean;
   optimizer_params: {
     weight_decay: number;
+    momentum?: number;
+    nesterov?: boolean;
+    ns_steps?: number;
+    eps?: number;
+    adjust_lr_fn?: string;
   };
   skip_first_sample: boolean;
   force_first_sample: boolean;

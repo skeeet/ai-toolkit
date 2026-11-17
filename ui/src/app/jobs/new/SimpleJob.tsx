@@ -32,6 +32,8 @@ import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
 import { handleModelArchChange } from './utils';
 import { IoFlaskSharp } from 'react-icons/io5';
 import { isMac } from '@/helpers/basic';
+import MuonControls from './MuonControls';
+import { selectOptimizer, shouldOfferMuon } from './muonConfig';
 
 type Props = {
   jobConfig: JobConfig;
@@ -736,7 +738,9 @@ export default function SimpleJob({
                 <SelectInput
                   label="Optimizer"
                   value={jobConfig.config.process[0].train.optimizer}
-                  onChange={value => setJobConfig(value, 'config.process[0].train.optimizer')}
+                  onChange={value =>
+                    setJobConfig(selectOptimizer(jobConfig.config.process[0].train, value), 'config.process[0].train')
+                  }
                   options={[
                     { value: 'adafactor', label: 'Adafactor' },
                     { value: 'adam', label: 'Adam' },
@@ -748,6 +752,9 @@ export default function SimpleJob({
                     { value: 'automagic4', label: 'Automagic v4' },
                     { value: 'prodigyopt', label: 'Prodigy' },
                     { value: 'prodigy8bit', label: 'Prodigy8Bit' },
+                    ...(shouldOfferMuon(jobConfig.config.process[0], !isLlmModel)
+                      ? [{ value: 'muon', label: 'Muon (RMS matched)' }]
+                      : []),
                   ]}
                 />
                 <NumberInput
@@ -768,6 +775,7 @@ export default function SimpleJob({
                   min={0}
                   required
                 />
+                <MuonControls train={jobConfig.config.process[0].train} setJobConfig={setJobConfig} />
               </div>
               {!isLlmModel && (
                 <div>

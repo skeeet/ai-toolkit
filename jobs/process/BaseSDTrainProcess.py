@@ -2164,6 +2164,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         optimizer_type = self.train_config.optimizer.lower()
         
+        if optimizer_type == 'muon':
+            from toolkit.optimizers.muon_training import validate_process as validate_muon_process
+            validate_muon_process(self)
+
         # esure params require grad
         self.ensure_params_requires_grad(force=True)
         optimizer = get_optimizer(self.params, optimizer_type, learning_rate=self.train_config.lr,
@@ -2194,13 +2198,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     load_optimizer = False
 
             if load_optimizer:
+                loaded_muon_state = False
                 try:
                     print_acc(f"Loading optimizer state from {optimizer_state_file_path}")
                     optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True)
+                    loaded_muon_state = isinstance(optimizer_state_dict, dict) and 'muon_state_version' in optimizer_state_dict
+                    if optimizer_type != 'muon' and loaded_muon_state:
+                        raise ValueError('Cannot resume Muon state with another optimizer; start a new run')
                     optimizer.load_state_dict(optimizer_state_dict)
                     del optimizer_state_dict
                     flush()
                 except Exception as e:
+                    if optimizer_type == 'muon' or loaded_muon_state:
+                        raise ValueError('Incompatible Muon optimizer resume; start a new run to change optimizers') from e
                     print_acc(f"Failed to load optimizer state from {optimizer_state_file_path}")
                     print_acc(e)
 
@@ -2657,6 +2667,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 optimizer.zero_grad(set_to_none=True)
                 flush()
                 torch.cuda.ipc_collect()
+                if self.train_config.optimizer.lower() == 'muon':
+                    from toolkit.optimizers.muon_training import discard_gradients
+                    discard_gradients(self)
                 # skip this step and keep going
                 print_acc("")
                 print_acc("################################################")

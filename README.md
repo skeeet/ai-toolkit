@@ -221,6 +221,46 @@ from the last checkpoint.
 
 IMPORTANT. If you press crtl+c while it is saving, it will likely corrupt that checkpoint. So wait until it is done saving
 
+### Optional Muon optimizer
+
+Set `train.optimizer: muon` for single-process denoiser adapter training when every optimized parameter is a nonempty dense 2D matrix. Muon checks LoRA, LoKr, LoCON, LyCORIS, LoRM, and DoRA jobs against the parameters created by their adapter settings. MOSS-Image requires Base weights. Edit jobs, text-encoder training, extra trainables, and FSDP are unsupported.
+
+```yaml
+train:
+  optimizer: muon
+  lr: 0.0001
+  optimizer_params:
+    weight_decay: 0.01
+    momentum: 0.95
+    nesterov: true
+    ns_steps: 5
+    eps: 0.0000001
+    adjust_lr_fn: match_rms_adamw
+```
+
+These optimizer defaults follow [Fizgig's MOSS presets and Muon implementation](https://github.com/shootthesound/Fizgig/tree/11c43efe/src/fizgig/training). The adapter rank, training resolution, number of steps, EMA, timestep distribution, and other recipe choices remain controlled by your existing configuration. `0.0001` is a starting learning rate, not a guarantee of better quality.
+
+The RMS adjustment uses `0.2 * lr * sqrt(max(rows, columns))` for each matrix, following [PyTorch's Muon definition](https://docs.pytorch.org/docs/stable/generated/torch.optim.Muon.html). Orthogonalization uses five Newton–Schulz iterations in bfloat16. Momentum state uses the parameter dtype. Same-shaped matrices are batched without combining optimizer groups, learning rates, devices, or dtypes. `optimizer_params.max_batch_bytes` optionally controls the estimated temporary batch budget (default 67108864 bytes); one matrix is the minimum unit and can exceed this budget.
+
+If optimizer setup reports a convolutional factor, bias, LoCON scalar, or DoRA magnitude vector, choose another optimizer or select adapter settings that produce matrices only. Transformer-block optimizer grouping can be used with the separate grouping patch. Start a new run when switching between fused and split-QKV adapter layouts.
+
+Per-image loss weighting changes gradient contributions. With Muon's normalized updates, multiplying a batch-one loss by 0.25 does not generally reduce the parameter update to one quarter. This optimizer does not provide a separate optimizer state or learning rate for each image.
+
+Start a new output directory when switching from another optimizer. Muon checkpoints validate their version, parameter shapes and groups before loading. Loading adapter weights into a new run is separate from resuming optimizer state.
+
+#### Validation
+
+Run the offline CPU tests from the repository root using the existing Python environment:
+
+```bash
+CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  python -B -m unittest -v testing.test_muon testing.test_muon_training
+```
+
+With the existing UI dependencies installed, run `node --test ui/testing/muon-controls.test.cjs` to check the training form controls.
+
+UI source changes require a build and restart. GPU training speed, memory use and image quality have not been measured.
+
 ### Need help?
 
 Please do not open a bug report unless it is a bug in the code. You are welcome to [Join my Discord](https://discord.gg/VXmU2f5WEU)

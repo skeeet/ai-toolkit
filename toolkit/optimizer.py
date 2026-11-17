@@ -73,6 +73,9 @@ def get_optimizer(
             return bitsandbytes.optim.Lion8bit(params, lr=learning_rate, **optimizer_params)
         else:
             raise ValueError(f'Unknown optimizer type {optimizer_type}')
+    elif lower_type == 'muon':
+        from toolkit.optimizers.muon import Muon
+        optimizer = Muon(params, lr=float(learning_rate), **optimizer_params)
     elif lower_type == 'adam':
         optimizer = torch.optim.Adam(params, lr=float(learning_rate), eps=1e-6, **optimizer_params)
     elif lower_type == 'adamw':
