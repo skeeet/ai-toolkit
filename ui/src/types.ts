@@ -114,6 +114,7 @@ export interface DatasetConfig {
   mask_min_value: number;
   default_caption: string;
   caption_ext: string;
+  moss_layout_bbox_transform?: boolean;
   caption_dropout_rate: number;
   shuffle_tokens?: boolean;
   is_reg: boolean;

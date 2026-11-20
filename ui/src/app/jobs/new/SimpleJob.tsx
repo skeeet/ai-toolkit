@@ -1325,6 +1325,17 @@ export default function SimpleJob({
                           { value: 'caption', label: 'caption' },
                         ]}
                       />
+                      {modelArch?.name.split(':')[0] === 'moss_image' &&
+                        (dataset.caption_ext || '').replace(/^\./, '').toLowerCase() === 'json' && (
+                          <Checkbox
+                            label="Align MOSS layout boxes to buckets"
+                            className="pt-2"
+                            checked={dataset.moss_layout_bbox_transform ?? false}
+                            onChange={value =>
+                              setJobConfig(value, `config.process[0].datasets[${i}].moss_layout_bbox_transform`)
+                            }
+                          />
+                        )}
 
                       {modelArch?.additionalSections?.includes('datasets.num_frames') && !dataset.auto_frame_count && (
                         <NumberInput

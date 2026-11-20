@@ -164,6 +164,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if raw_datasets is not None and len(raw_datasets) > 0:
             for raw_dataset in raw_datasets:
                 dataset = DatasetConfig(**raw_dataset)
+                dataset.validate_moss_layout_training(
+                    self.model_config.arch, self.trigger_word, self.train_config.prompt_saturation_chance
+                )
                 # handle trigger word per dataset
                 if dataset.trigger_word is None and self.trigger_word is not None:
                     dataset.trigger_word = self.trigger_word
@@ -1059,7 +1062,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 conditioned_prompts = []
 
-                for prompt, is_reg in zip(prompts, is_reg_list):
+                for idx, (prompt, is_reg) in enumerate(zip(prompts, is_reg_list)):
+                    file_item = batch.file_items[idx % len(batch.file_items)]
 
                     # make sure the embedding is in the prompts
                     if self.embedding is not None:
@@ -1076,8 +1080,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             add_if_not_present=not is_reg,
                         )
 
-                    # make sure trigger is in the prompts if not a regularization run
-                    if self.trigger_word is not None:
+                    # Opt-in MOSS captions already carry the trigger inside the JSON.
+                    if self.trigger_word is not None and not getattr(file_item, "moss_layout_bbox_transform", False):
                         prompt = self.sd.inject_trigger_into_prompt(
                             prompt,
                             trigger=self.trigger_word,

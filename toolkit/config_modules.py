@@ -954,6 +954,7 @@ class DatasetConfig:
         # if caption_ext doesnt start with a dot, add it
         if self.caption_ext and not self.caption_ext.startswith('.'):
             self.caption_ext = '.' + self.caption_ext
+        self.moss_layout_bbox_transform: bool = kwargs.get('moss_layout_bbox_transform', False)
         self.random_scale: bool = kwargs.get('random_scale', False)
         self.random_crop: bool = kwargs.get('random_crop', False)
         self.resolution: int = kwargs.get('resolution', 512)
@@ -1111,6 +1112,22 @@ class DatasetConfig:
         self.do_audio: bool = kwargs.get('do_audio', False) # load audio from video files for models that support it
         self.audio_preserve_pitch: bool = kwargs.get('audio_preserve_pitch', False) # preserve pitch when stretching audio to fit num_frames
         self.audio_normalize: bool = kwargs.get('audio_normalize', False) # normalize audio volume levels when loading
+
+
+    def transforms_moss_layout_boxes(self, model_arch: str) -> bool:
+        return (
+            self.moss_layout_bbox_transform
+            and model_arch == "moss_image"
+            and (self.caption_ext or "").lower().lstrip(".") == "json"
+        )
+
+    def validate_moss_layout_training(self, model_arch: str, job_trigger, prompt_saturation_chance: float):
+        if not self.transforms_moss_layout_boxes(model_arch):
+            return
+        if prompt_saturation_chance > 0:
+            raise ValueError("MOSS layout JSON requires train.prompt_saturation_chance: 0")
+        if job_trigger and self.trigger_word not in (None, job_trigger):
+            raise ValueError("MOSS layout JSON requires dataset trigger_word to match the job trigger_word")
 
 
 def preprocess_dataset_raw_config(raw_config: List[dict]) -> List[dict]:

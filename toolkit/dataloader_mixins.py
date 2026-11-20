@@ -25,6 +25,7 @@ from toolkit.config_modules import ControlTypes
 from toolkit.control_generator import ControlGenerator
 from toolkit.dto import DTO, DISK_PREFIX
 from toolkit.metadata import get_meta_for_safetensors
+from toolkit.moss_layout import rewrite_moss_layout_descriptions, transform_moss_layout_boxes
 from toolkit.models.pixtral_vision import PixtralVisionImagePreprocessorCompatible
 from toolkit.prompt_utils import inject_trigger_into_prompt
 from torchvision import transforms
@@ -391,6 +392,7 @@ class CaptionProcessingDTOMixin:
             dataset_config: DatasetConfig = kwargs.get('dataset_config', None)
             self.extra_values: List[float] = dataset_config.extra_values
             self.trigger_word = dataset_config.trigger_word
+            self.moss_layout_bbox_transform = kwargs.get("moss_layout_bbox_transform", False)
 
     # todo allow for loading from sd-scripts style dict
     def load_caption(self: 'FileItemDTO', caption_dict: Union[dict, None]=None):
@@ -482,6 +484,31 @@ class CaptionProcessingDTOMixin:
             if rand < self.dataset_config.caption_dropout_rate:
                 # drop the caption
                 return ''
+
+        if self.moss_layout_bbox_transform:
+            try:
+                raw_caption = transform_moss_layout_boxes(
+                    raw_caption,
+                    (self.width, self.height),
+                    (self.scale_to_width, self.scale_to_height),
+                    (self.crop_x, self.crop_y, self.crop_width, self.crop_height),
+                    flip_x=self.flip_x,
+                    flip_y=self.flip_y,
+                )
+                layout_caption = rewrite_moss_layout_descriptions(
+                    raw_caption,
+                    lambda text: inject_trigger_into_prompt(
+                        text, trigger,
+                        list(to_replace_list) if to_replace_list is not None else None,
+                        add_if_not_present=False,
+                    ),
+                    trigger_to_add=trigger if add_if_not_present else None,
+                )
+                if layout_caption is not None:
+                    return layout_caption
+            except ValueError as error:
+                caption_path = os.path.splitext(self.path)[0] + self.dataset_config.caption_ext
+                raise ValueError(f"Invalid MOSS layout in {caption_path}: {error}") from error
 
         # tag-style token ops (dropout / shuffle) split on commas; anything else keeps the
         # text exactly as written (splitting and re-joining with ", " doubled the space after
@@ -2529,6 +2556,8 @@ class TextEmbeddingCachingMixin:
             for file_item in tqdm(self.file_list, desc='Caching text embeddings to disk'):
                 file_item.latent_load_device = self.sd.device
 
+                if file_item.moss_layout_bbox_transform and self.caption_dict is not None:
+                    file_item.load_caption(self.caption_dict)
                 text_embedding_path = file_item.get_text_embedding_path(recalculate=True)
                 # (path, caption) pairs to encode for this item
                 encode_targets = [(text_embedding_path, file_item.caption)]

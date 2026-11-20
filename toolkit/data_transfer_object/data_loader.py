@@ -148,6 +148,13 @@ class FileItemDTO(
                 # Release the video capture object immediately
                 video.release()
                 size_database[file_key] = (width, height, file_signature, video_total_frames, video_fps)
+        elif kwargs.get("moss_layout_bbox_transform"):
+            # Layout coordinates are measured after EXIF orientation. Older size
+            # caches and fast header readers may report the stored orientation.
+            with Image.open(self.path) as img:
+                w, h = img.size
+                if img.getexif().get(274) in (5, 6, 7, 8):
+                    w, h = h, w
         elif use_db_entry:
             w, h, _ = db_entry[:3]
         else:

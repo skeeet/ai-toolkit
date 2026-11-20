@@ -474,6 +474,16 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             dataset_path = dataset_config.folder_path
         transform = self.transform if dataset_config is self.dataset_config else self._build_transform(dataset_config)
         caption_dict = None
+        transform_layout_boxes = dataset_config.transforms_moss_layout_boxes(getattr(self.sd, "arch", None))
+        if transform_layout_boxes:
+            if not dataset_config.buckets:
+                raise ValueError("MOSS layout box transforms require buckets")
+            if dataset_config.augmentations:
+                raise ValueError("MOSS layout box transforms cannot track Albumentations")
+            if dataset_config.shuffle_tokens or dataset_config.token_dropout_rate or dataset_config.random_triggers:
+                raise ValueError(
+                    "MOSS layout JSON requires token shuffling, token dropout, and random triggers off"
+                )
 
         # check if dataset_path is a folder or json
         if os.path.isdir(dataset_path):
@@ -560,6 +570,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     path=file,
                     is_audio_model=self.is_audio_model or (self.is_multimodal_llm and file.lower().endswith(tuple(audio_extensions))),
                     dataset_config=dataset_config,
+                    moss_layout_bbox_transform=transform_layout_boxes,
                     dataloader_transforms=transform,
                     size_database=size_database,
                     dataset_root=dataset_folder,
@@ -672,6 +683,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
 
     def _get_single_item(self, index, _attempts=0) -> 'FileItemDTO':
         file_item: 'FileItemDTO' = copy.deepcopy(self.file_list[index])
+        if file_item.moss_layout_bbox_transform:
+            file_item.load_caption(self.caption_dict)
         try:
             file_item.load_and_process_image(file_item.dataloader_transforms or self.transform)
         except Exception as e:
@@ -681,7 +694,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 raise
             new_index = self._get_replacement_index(index)
             return self._get_single_item(new_index, _attempts=_attempts + 1)
-        file_item.load_caption(self.caption_dict)
+        if not file_item.moss_layout_bbox_transform:
+            file_item.load_caption(self.caption_dict)
         return file_item
 
     def __getitem__(self, item):
